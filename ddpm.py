@@ -1,0 +1,145 @@
+### Program implementing Deep Denoising Diffusion Model (DDPM) - Ho et. al.
+
+## Features:
+# 1. Progressively add gaussian noise (defined noising schedule) to an image as a gaussian process / Markov chain - Forward process
+# 2. Progressively denoise the image to obtain original image as a parameterized gaussian process / Markov chain -  Reverse process
+
+# 3. This implementation (ddpm2.py) is different from ddpm.py in the following:
+# 3.1. Uses sigma = beta instead of sigma = beta_tilde while sampling
+# 3.2. Uses torchvision's dataloader (faster) instead of manual data load function (slower). Also added data-augmentation via random cropping.
+# 3.3. Samples n=batch_size instead of n=1
+
+## Todos / Questions:
+# 1. img pixels: clamp value in [-1, 1]
+
+# 2. Remember the 4 lines:
+## i.   loss = calculate_loss()
+## ii.  optimizer.zero_grad()
+## iii. loss.backward()
+## iv.  optimizer.step()
+
+import os
+import cv2
+from PIL import Image
+import numpy as np
+import torch
+import torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+from unet import *
+
+
+def noise_schedule(beta_min, beta_max, max_time_steps):
+    return torch.linspace(beta_min, beta_max, max_time_steps)
+
+def noise_img(img_ori, alphas_hat, t, device):
+    sqrt_alpha_hat = torch.sqrt(alphas_hat[t])[:, None, None, None]
+    sqrt_one_minus_alpha_hat = torch.sqrt(1 - alphas_hat[t])[:, None, None, None]
+    eps = torch.randn_like(img_ori)
+    noised_img = ( sqrt_alpha_hat * img_ori ) + ( sqrt_one_minus_alpha_hat * eps )
+    return noised_img, eps
+
+
+def sample2(net, alphas_hat, betas, alphas, max_time_steps, img_size, device, n):
+    net.eval()
+    with torch.no_grad():
+        x = torch.randn((n, 3, img_size, img_size)).to(device)
+        for i in tqdm( reversed(range(1, max_time_steps)), position=0 ):
+            t = (torch.ones(n) * i).long().to(device)
+            predicted_noise = net(x, t)
+            alpha = alphas[t][:, None, None, None]
+            alpha_hat = alphas_hat[t][:, None, None, None]
+            beta = betas[t][:, None, None, None]
+            if i > 1:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+            x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
+    net.train()
+    x = (x.clamp(-1, 1) + 1) / 2
+    x = (x * 255).type(torch.uint8)
+    return x
+
+def save_img2(img, name):
+    name = 'generated2/' + name
+    grid = torchvision.utils.make_grid(img)
+    ndarr = grid.permute(1, 2, 0).to('cpu').numpy()
+    im = Image.fromarray(ndarr)
+    im.save(name)
+
+# fetch dataset - using data loader
+def get_data(img_size, datapath, batch_size):
+    transforms = torchvision.transforms.Compose([
+        torchvision.transforms.Resize(80),  # args.image_size + 1/4 *args.image_size
+        torchvision.transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # equivalent to transforming pixel values from range [0,1] to [-1,1]
+    ])
+    dataset = torchvision.datasets.ImageFolder(datapath, transform=transforms)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return dataloader
+
+
+### main
+if __name__ == '__main__':
+    # hyperparams
+    beta_min = 1e-4
+    beta_max = 0.02
+    max_time_steps = 1000
+    img_size = 64
+    lr = 3e-4
+    batch_size = 2
+    max_epochs = 3000
+    random_seed = 10
+
+    # set random seed
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+
+    # device
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # init UNet
+    net = UNet(device=device).to(device)
+
+    # calcualate betas and alphas
+    betas = noise_schedule(beta_min, beta_max, max_time_steps)
+    alphas = 1 - betas
+    alphas_hat = torch.cumprod(alphas, dim=0)
+    alphas_hat = alphas_hat.to(device)
+    betas = betas.to(device)
+    alphas = alphas.to(device)
+
+    # load img dataset
+    dataloader = get_data(img_size, './images', batch_size)
+
+    # optimizer and loss criterion
+    optimizer = torch.optim.AdamW(params=net.parameters(), lr=lr)
+    mse_loss = nn.MSELoss()
+
+    # train
+    for ep in tqdm(range(max_epochs)):
+
+        # fetch minibatch
+        for imgs, _ in tqdm(dataloader):
+            imgs = imgs.to(device)
+
+            t = torch.randint(low=1, high=max_time_steps, size=(batch_size,)).to(device) # sample a time step uniformly
+            noised_imgs, noise = noise_img(imgs, alphas_hat, t, device) # get noised imgs and the noise
+
+            pred_noise = net(noised_imgs, t)
+
+            loss = mse_loss(noise, pred_noise)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        print('ep:{} \t loss:{}'.format(ep, loss.item()))
+
+        sampled_img = sample2(net, alphas_hat, betas, alphas, max_time_steps, imgs.shape[-1], device, batch_size)
+
+        save_img2(sampled_img, str(ep)+'.png')
